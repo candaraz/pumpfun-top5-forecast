@@ -1,132 +1,157 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const inputDir = process.env.MAKEFUN_INPUT_DIR || "/input";
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
+const inputDir = process.env.MAKEFUN_INPUT_DIR ?? "/input";
+const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
 const task = JSON.parse(fs.readFileSync(path.join(inputDir, "task.json"), "utf8"));
 const lines = fs.readFileSync(path.join(inputDir, "history.ndjson"), "utf8")
   .split(/\r?\n/)
   .filter((line) => line.trim().length > 0);
-
 const marks = lines.map((line) => JSON.parse(line));
-const cadenceHours = (Number(task.cadence_minutes) || 60) / 60;
+
+const cadenceMinutes = Number(task.cadence_minutes) > 0 ? Number(task.cadence_minutes) : 60;
 const parseTime = (value) => {
   const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed / 3600000 : NaN;
+  return Number.isFinite(parsed) ? parsed : NaN;
 };
-const parsedTimes = marks.map((mark) => {
-  const value = mark.read_at ?? mark.observed_at ?? mark.timestamp ?? mark.time ?? mark.at;
-  return typeof value === "string" ? parseTime(value) : NaN;
-});
-const hasMarkTimes = parsedTimes.length > 0 && parsedTimes.every(Number.isFinite);
-const times = marks.map((_, index) =>
-  hasMarkTimes ? parsedTimes[index] : index * cadenceHours);
-const answerTimes = Array.isArray(task.reads) ? task.reads : [];
-const lastTime = times.at(-1) ?? 0;
-const futureHours = hasMarkTimes
-  ? answerTimes
-    .map(parseTime)
-    .filter((time) => Number.isFinite(time) && time >= lastTime)
-    .map((time) => time - lastTime)
-  : [];
-const horizon = futureHours.length
-  ? futureHours.reduce((sum, hours) => sum + hours, 0) / futureHours.length
-  : 10;
+const rawMarkTimes = marks.map((mark) =>
+  parseTime(mark.at ?? mark.read_at ?? mark.observed_at ?? mark.timestamp ?? mark.time));
+const hasMarkTimes = rawMarkTimes.length > 0 && rawMarkTimes.every(Number.isFinite);
+const markTimes = marks.map((_, index) =>
+  hasMarkTimes ? rawMarkTimes[index] : index * cadenceMinutes * 60_000);
+const reads = Array.isArray(task.reads) ? task.reads : [];
+const middleRead = reads.length > 0 ? parseTime(reads[Math.floor(reads.length / 2)]) : NaN;
+const lastMarkTime = markTimes.at(-1) ?? 0;
+const hoursAhead = Number.isFinite(middleRead)
+  ? Math.max(0, Math.min(13, (middleRead - lastMarkTime) / 3_600_000))
+  : 0;
+const cadenceHours = cadenceMinutes / 60;
 
 const observations = new Map();
-const latestRows = marks.at(-1)?.rows ?? [];
 for (let markIndex = 0; markIndex < marks.length; markIndex += 1) {
   const rows = marks[markIndex]?.rows;
   if (!Array.isArray(rows)) continue;
   for (const row of rows) {
-    if (typeof row.mint !== "string" || !row.mint) continue;
+    if (typeof row.mint !== "string" || row.mint.length === 0) continue;
     const lamports = Number(row.market_cap_lamports);
-    if (!Number.isFinite(lamports) || lamports <= 0) continue;
-    const logCap = Math.log10(lamports) - 9;
-    if (!observations.has(row.mint)) observations.set(row.mint, []);
-    observations.get(row.mint).push({ time: times[markIndex], logCap });
+    const rank = Number(row.rank);
+    if (!Number.isFinite(lamports) || lamports <= 0 || !Number.isFinite(rank)) continue;
+    const samples = observations.get(row.mint) ?? [];
+    samples.push({
+      index: markIndex,
+      x: Math.log10(lamports / 1e9),
+      rank,
+    });
+    observations.set(row.mint, samples);
   }
 }
 
-const regressionSlope = (samples) => {
-  if (samples.length < 3) return 0;
-  const newest = samples.at(-1).time;
-  const points = samples.slice(-6).map((sample, index, recent) => ({
-    x: sample.time - newest,
-    y: sample.logCap,
-    weight: index + 1,
-  }));
-  const totalWeight = points.reduce((sum, point) => sum + point.weight, 0);
-  const meanX = points.reduce((sum, point) => sum + point.x * point.weight, 0) / totalWeight;
-  const meanY = points.reduce((sum, point) => sum + point.y * point.weight, 0) / totalWeight;
-  const numerator = points.reduce(
-    (sum, point) => sum + point.weight * (point.x - meanX) * (point.y - meanY), 0,
-  );
-  const denominator = points.reduce(
-    (sum, point) => sum + point.weight * (point.x - meanX) ** 2, 0,
-  );
-  return denominator > 0 ? numerator / denominator : 0;
-};
-
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const candidates = [];
-for (const row of latestRows) {
-  if (typeof row.mint !== "string" || !row.mint || candidates.some((coin) => coin.mint === row.mint)) continue;
-  const samples = observations.get(row.mint) ?? [];
-  const rowCap = Number(row.market_cap_lamports);
-  const latestCap = samples.at(-1)?.logCap
-    ?? (Number.isFinite(rowCap) && rowCap > 0 ? Math.log10(rowCap) - 9 : NaN);
-  if (!Number.isFinite(latestCap)) continue;
-  const slope = marks.length >= 3 ? regressionSlope(samples) : 0;
-  const shift = Math.max(-0.5, Math.min(0.5, slope * 0.35 * horizon));
-  candidates.push({ mint: row.mint, cap: latestCap + shift, rank: Number(row.rank) });
+for (const [mint, samples] of observations) {
+  let totalWeight = 0;
+  let weightedX = 0;
+  let weightedRank = 0;
+  for (const sample of samples) {
+    const weight = Math.exp(-(marks.length - 1 - sample.index) / 3);
+    totalWeight += weight;
+    weightedX += weight * sample.x;
+    weightedRank += weight * sample.rank;
+  }
+
+  const recent = samples.slice(-6);
+  const meanIndex = recent.reduce((sum, sample) => sum + sample.index, 0) / recent.length;
+  const meanX = recent.reduce((sum, sample) => sum + sample.x, 0) / recent.length;
+  const denominator = recent.reduce((sum, sample) => sum + (sample.index - meanIndex) ** 2, 0);
+  const slope = denominator > 0
+    ? recent.reduce((sum, sample) =>
+      sum + (sample.index - meanIndex) * (sample.x - meanX), 0) / denominator
+    : 0;
+
+  candidates.push({
+    mint,
+    meanX: weightedX / totalWeight,
+    slope: clamp(slope, -0.25, 0.25),
+    meanRank: weightedRank / totalWeight,
+    presentLast: samples.at(-1)?.index === marks.length - 1,
+  });
+}
+
+for (const coin of candidates) {
+  coin.predX = coin.meanX + 0.6 * coin.slope * hoursAhead / cadenceHours;
 }
 candidates.sort((a, b) =>
-  b.cap - a.cap || (a.rank || Infinity) - (b.rank || Infinity) || a.mint.localeCompare(b.mint));
+  b.predX - a.predX || a.meanRank - b.meanRank || a.mint.localeCompare(b.mint));
+for (let index = 0; index < candidates.length; index += 1) {
+  candidates[index].predRank = index + 1 + (candidates[index].presentLast ? 0 : 3);
+}
+
+const round6 = (value) => Math.round(value * 1_000_000) / 1_000_000;
+const probabilities = [];
+if (marks.length < 3) {
+  const latestByRank = new Map();
+  for (const row of marks.at(-1)?.rows ?? []) {
+    const rank = Number(row.rank);
+    if (typeof row.mint === "string" && Number.isFinite(rank) && !latestByRank.has(rank)) {
+      latestByRank.set(rank, row);
+    }
+  }
+  for (let place = 1; place <= 5; place += 1) {
+    for (const [rank, p] of [[place, 0.5], [place - 1, 0.15], [place + 1, 0.15]]) {
+      const row = latestByRank.get(rank);
+      if (row?.mint) probabilities.push({ mint: row.mint, place, p });
+    }
+  }
+} else {
+  for (let place = 1; place <= 5; place += 1) {
+    const sigma = place <= 2 ? 1.8 : 2.4;
+    const nearest = candidates
+      .map((coin) => ({
+        coin,
+        weight: Math.exp(-0.5 * ((coin.predRank - place) / sigma) ** 2),
+      }))
+      .sort((a, b) =>
+        Math.abs(a.coin.predRank - place) - Math.abs(b.coin.predRank - place)
+        || a.coin.predRank - b.coin.predRank
+        || a.coin.mint.localeCompare(b.coin.mint))
+      .slice(0, 10);
+    const total = nearest.reduce((sum, item) => sum + item.weight, 0);
+    for (const item of nearest) {
+      const p = round6(0.95 * item.weight / total);
+      if (p > 0) probabilities.push({ mint: item.coin.mint, place, p });
+    }
+  }
+}
 
 const normalCdf = (x) => {
   const z = Math.abs(x) / Math.SQRT2;
   const t = 1 / (1 + 0.3275911 * z);
   const erf = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
     - 0.284496736) * t + 0.254829592) * t * Math.exp(-z * z);
-  return Math.max(0, Math.min(1, 0.5 * (1 + (x < 0 ? -erf : erf))));
+  return clamp(0.5 * (1 + (x < 0 ? -erf : erf)), 0, 1);
 };
-
-const probabilities = [];
-const namedCount = Math.min(25, candidates.length);
-for (let place = 1; place <= 5; place += 1) {
-  const weights = candidates.map((coin, index) => ({
-    coin,
-    weight: Math.exp(-0.5 * ((index + 1 - place) / 3.5) ** 2),
-  }));
-  const total = weights.reduce((sum, item) => sum + item.weight, 0);
-  for (const item of weights.slice(0, namedCount)) {
-    probabilities.push({ mint: item.coin.mint, place, p: item.weight / total });
-  }
-}
-
-const edges = Array.isArray(task.size?.edges)
-  ? task.size.edges.map(Number).filter(Number.isFinite)
+const providedEdges = Array.isArray(task.size?.edges) ? task.size.edges.map(Number) : [];
+const edges = providedEdges.length === 81 && providedEdges.every(Number.isFinite)
+  ? providedEdges
   : Array.from({ length: 81 }, (_, index) => 2 + index * 0.05);
 const sizes = [];
 for (let place = 1; place <= 5; place += 1) {
-  const center = candidates[place - 1]?.cap ?? candidates.at(-1)?.cap ?? 0;
-  const sd = 0.55;
+  const center = candidates[place - 1]?.predX ?? candidates.at(-1)?.predX ?? 0;
+  const sd = 0.45;
   const bins = [];
-  for (let bin = 0; bin <= edges.length; bin += 1) {
-    let probability;
-    if (bin === 0) {
-      probability = normalCdf((edges[0] - center) / sd);
-    } else if (bin === edges.length) {
-      probability = 1 - normalCdf((edges.at(-1) - center) / sd);
-    } else {
-      probability = normalCdf((edges[bin] - center) / sd)
-        - normalCdf((edges[bin - 1] - center) / sd);
-    }
-    bins.push(Math.max(0, probability));
+  for (let bin = 0; bin <= 81; bin += 1) {
+    const mass = bin === 0
+      ? normalCdf((edges[0] - center) / sd)
+      : bin === 81
+        ? 1 - normalCdf((edges[80] - center) / sd)
+        : normalCdf((edges[bin] - center) / sd)
+          - normalCdf((edges[bin - 1] - center) / sd);
+    bins.push(Math.max(0, mass));
   }
-  const total = bins.reduce((sum, probability) => sum + probability, 0);
-  for (let bin = 0; bin < bins.length; bin += 1) {
-    sizes.push({ place, bin, p: total > 0 ? bins[bin] / total : 0 });
+  const total = bins.reduce((sum, mass) => sum + mass, 0);
+  for (let bin = 0; bin <= 81; bin += 1) {
+    const p = round6(total > 0 ? bins[bin] / total : 0);
+    if (p > 0) sizes.push({ place, bin, p });
   }
 }
 
