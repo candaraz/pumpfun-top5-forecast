@@ -9,118 +9,95 @@ const lines = fs.readFileSync(path.join(inputDir, "history.ndjson"), "utf8")
   .filter((line) => line.trim().length > 0);
 const marks = lines.map((line) => JSON.parse(line));
 
-const cadenceMinutes = Number(task.cadence_minutes) > 0 ? Number(task.cadence_minutes) : 60;
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const parseTime = (value) => {
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : NaN;
 };
-const rawMarkTimes = marks.map((mark) =>
-  parseTime(mark.at ?? mark.read_at ?? mark.observed_at ?? mark.timestamp ?? mark.time));
-const hasMarkTimes = rawMarkTimes.length > 0 && rawMarkTimes.every(Number.isFinite);
-const markTimes = marks.map((_, index) =>
-  hasMarkTimes ? rawMarkTimes[index] : index * cadenceMinutes * 60_000);
+const markTimes = marks.map((mark) => parseTime(mark.at));
 const reads = Array.isArray(task.reads) ? task.reads : [];
 const middleRead = reads.length > 0 ? parseTime(reads[Math.floor(reads.length / 2)]) : NaN;
-const lastMarkTime = markTimes.at(-1) ?? 0;
-const hoursAhead = Number.isFinite(middleRead)
-  ? Math.max(0, Math.min(13, (middleRead - lastMarkTime) / 3_600_000))
+const firstMarkTime = markTimes[0];
+const lastMarkTime = markTimes.at(-1);
+const cadenceSeconds = marks.length > 1
+  && Number.isFinite(firstMarkTime)
+  && Number.isFinite(lastMarkTime)
+  ? (lastMarkTime - firstMarkTime) / (marks.length - 1) / 1000
+  : NaN;
+const marksAhead = Number.isFinite(middleRead)
+  && Number.isFinite(lastMarkTime)
+  && Number.isFinite(cadenceSeconds)
+  && cadenceSeconds > 0
+  ? clamp((middleRead - lastMarkTime) / 1000 / cadenceSeconds, 0, 120)
   : 0;
-const cadenceHours = cadenceMinutes / 60;
 
-const observations = new Map();
-for (let markIndex = 0; markIndex < marks.length; markIndex += 1) {
-  const rows = marks[markIndex]?.rows;
+const usableMarks = [];
+for (let index = 0; index < marks.length; index += 1) {
+  const rows = marks[index]?.rows;
+  if (!Array.isArray(rows) || rows.length < 5) continue;
+  const caps = rows.slice(0, 5).map((row) => Number(row.market_cap_lamports) / 1e9);
+  if (caps.some((cap) => !Number.isFinite(cap) || cap <= 0)) continue;
+  usableMarks.push({ index, at: markTimes[index], x: caps.map(Math.log10) });
+}
+
+const ladder = Array.from({ length: 5 }, (_, placeIndex) => {
+  let weightedTotal = 0;
+  let totalWeight = 0;
+  for (const mark of usableMarks) {
+    const weight = Math.exp(-(marks.length - 1 - mark.index) / 3);
+    weightedTotal += weight * mark.x[placeIndex];
+    totalWeight += weight;
+  }
+  return totalWeight > 0 ? weightedTotal / totalWeight : 0;
+});
+
+const median = (values) => {
+  if (values.length === 0) return 0;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1] + sorted[middle]) / 2
+    : sorted[middle];
+};
+const driftByPlace = Array.from({ length: 5 }, (_, placeIndex) => {
+  const changes = [];
+  for (let index = 1; index < usableMarks.length; index += 1) {
+    changes.push(usableMarks[index].x[placeIndex] - usableMarks[index - 1].x[placeIndex]);
+  }
+  return median(changes);
+});
+const drift = usableMarks.length >= 2
+  ? driftByPlace.reduce((sum, value) => sum + value, 0) / 5
+  : 0;
+const mu = ladder.map((value, index) => value + drift * marksAhead);
+const sd = clamp(0.45 + 0.02 * marksAhead, 0.45, 1.1);
+
+const rankWeights = new Map();
+for (let index = 0; index < marks.length; index += 1) {
+  const rows = marks[index]?.rows;
   if (!Array.isArray(rows)) continue;
+  const weight = Math.exp(-(marks.length - 1 - index) / 3);
   for (const row of rows) {
     if (typeof row.mint !== "string" || row.mint.length === 0) continue;
-    const lamports = Number(row.market_cap_lamports);
     const rank = Number(row.rank);
-    if (!Number.isFinite(lamports) || lamports <= 0 || !Number.isFinite(rank)) continue;
-    const samples = observations.get(row.mint) ?? [];
-    samples.push({
-      index: markIndex,
-      x: Math.log10(lamports / 1e9),
-      rank,
-    });
-    observations.set(row.mint, samples);
+    if (!Number.isFinite(rank)) continue;
+    const totals = rankWeights.get(row.mint) ?? { weightedRank: 0, weight: 0 };
+    totals.weightedRank += weight * rank;
+    totals.weight += weight;
+    rankWeights.set(row.mint, totals);
   }
 }
+const candidates = Array.from(rankWeights, ([mint, totals]) => ({
+  mint,
+  predictedRank: totals.weightedRank / totals.weight,
+})).sort((a, b) => a.predictedRank - b.predictedRank || a.mint.localeCompare(b.mint));
 
-const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
-const candidates = [];
-for (const [mint, samples] of observations) {
-  let totalWeight = 0;
-  let weightedX = 0;
-  let weightedRank = 0;
-  for (const sample of samples) {
-    const weight = Math.exp(-(marks.length - 1 - sample.index) / 3);
-    totalWeight += weight;
-    weightedX += weight * sample.x;
-    weightedRank += weight * sample.rank;
-  }
-
-  const recent = samples.slice(-6);
-  const meanIndex = recent.reduce((sum, sample) => sum + sample.index, 0) / recent.length;
-  const meanX = recent.reduce((sum, sample) => sum + sample.x, 0) / recent.length;
-  const denominator = recent.reduce((sum, sample) => sum + (sample.index - meanIndex) ** 2, 0);
-  const slope = denominator > 0
-    ? recent.reduce((sum, sample) =>
-      sum + (sample.index - meanIndex) * (sample.x - meanX), 0) / denominator
-    : 0;
-
-  candidates.push({
-    mint,
-    meanX: weightedX / totalWeight,
-    slope: clamp(slope, -0.25, 0.25),
-    meanRank: weightedRank / totalWeight,
-    presentLast: samples.at(-1)?.index === marks.length - 1,
-  });
-}
-
-for (const coin of candidates) {
-  coin.predX = coin.meanX + 0.6 * coin.slope * hoursAhead / cadenceHours;
-}
-candidates.sort((a, b) =>
-  b.predX - a.predX || a.meanRank - b.meanRank || a.mint.localeCompare(b.mint));
-for (let index = 0; index < candidates.length; index += 1) {
-  candidates[index].predRank = index + 1 + (candidates[index].presentLast ? 0 : 3);
-}
-
-const round6 = (value) => Math.round(value * 1_000_000) / 1_000_000;
 const probabilities = [];
-if (marks.length < 3) {
-  const latestByRank = new Map();
-  for (const row of marks.at(-1)?.rows ?? []) {
-    const rank = Number(row.rank);
-    if (typeof row.mint === "string" && Number.isFinite(rank) && !latestByRank.has(rank)) {
-      latestByRank.set(rank, row);
-    }
-  }
-  for (let place = 1; place <= 5; place += 1) {
-    for (const [rank, p] of [[place, 0.5], [place - 1, 0.15], [place + 1, 0.15]]) {
-      const row = latestByRank.get(rank);
-      if (row?.mint) probabilities.push({ mint: row.mint, place, p });
-    }
-  }
-} else {
-  for (let place = 1; place <= 5; place += 1) {
-    const sigma = place <= 2 ? 1.8 : 2.4;
-    const nearest = candidates
-      .map((coin) => ({
-        coin,
-        weight: Math.exp(-0.5 * ((coin.predRank - place) / sigma) ** 2),
-      }))
-      .sort((a, b) =>
-        Math.abs(a.coin.predRank - place) - Math.abs(b.coin.predRank - place)
-        || a.coin.predRank - b.coin.predRank
-        || a.coin.mint.localeCompare(b.coin.mint))
-      .slice(0, 10);
-    const total = nearest.reduce((sum, item) => sum + item.weight, 0);
-    for (const item of nearest) {
-      const p = round6(0.95 * item.weight / total);
-      if (p > 0) probabilities.push({ mint: item.coin.mint, place, p });
-    }
-  }
+for (let place = 1; place <= 5; place += 1) {
+  const candidate = candidates.slice().sort((a, b) =>
+    Math.abs(a.predictedRank - place) - Math.abs(b.predictedRank - place)
+    || a.mint.localeCompare(b.mint))[0];
+  if (candidate) probabilities.push({ mint: candidate.mint, place, p: 0.08 });
 }
 
 const normalCdf = (x) => {
@@ -130,27 +107,39 @@ const normalCdf = (x) => {
     - 0.284496736) * t + 0.254829592) * t * Math.exp(-z * z);
   return clamp(0.5 * (1 + (x < 0 ? -erf : erf)), 0, 1);
 };
-const providedEdges = Array.isArray(task.size?.edges) ? task.size.edges.map(Number) : [];
-const edges = providedEdges.length === 81 && providedEdges.every(Number.isFinite)
-  ? providedEdges
-  : Array.from({ length: 81 }, (_, index) => 2 + index * 0.05);
+const edges = task.size?.edges;
+if (!Array.isArray(edges) || edges.length !== 81
+  || edges.some((edge) => !Number.isFinite(Number(edge)))) {
+  throw new Error("task.size.edges must contain 81 finite bin edges");
+}
+const numericEdges = edges.map(Number);
+if (numericEdges.some((edge, index) => index > 0 && edge <= numericEdges[index - 1])) {
+  throw new Error("task.size.edges must be strictly increasing");
+}
 const sizes = [];
 for (let place = 1; place <= 5; place += 1) {
-  const center = candidates[place - 1]?.predX ?? candidates.at(-1)?.predX ?? 0;
-  const sd = 0.45;
-  const bins = [];
+  const center = mu[place - 1];
+  const masses = [];
   for (let bin = 0; bin <= 81; bin += 1) {
     const mass = bin === 0
-      ? normalCdf((edges[0] - center) / sd)
+      ? normalCdf((numericEdges[0] - center) / sd)
       : bin === 81
-        ? 1 - normalCdf((edges[80] - center) / sd)
-        : normalCdf((edges[bin] - center) / sd)
-          - normalCdf((edges[bin - 1] - center) / sd);
-    bins.push(Math.max(0, mass));
+        ? 1 - normalCdf((numericEdges[80] - center) / sd)
+        : normalCdf((numericEdges[bin] - center) / sd)
+          - normalCdf((numericEdges[bin - 1] - center) / sd);
+    masses.push(Math.max(0, mass));
   }
-  const total = bins.reduce((sum, mass) => sum + mass, 0);
+  const total = masses.reduce((sum, mass) => sum + mass, 0);
+  const rounded = masses.map((mass) =>
+    Math.round((total > 0 ? mass / total : 0) * 1_000_000) / 1_000_000);
+  const roundedTotal = rounded.reduce((sum, mass) => sum + mass, 0);
+  const largestBin = rounded.indexOf(Math.max(...rounded));
+  rounded[largestBin] = Math.max(0, rounded[largestBin] + 1 - roundedTotal);
+  while (rounded.reduce((sum, mass) => sum + mass, 0) > 1) {
+    rounded[largestBin] = Math.max(0, rounded[largestBin] - 0.000001);
+  }
   for (let bin = 0; bin <= 81; bin += 1) {
-    const p = round6(total > 0 ? bins[bin] / total : 0);
+    const p = rounded[bin];
     if (p > 0) sizes.push({ place, bin, p });
   }
 }
